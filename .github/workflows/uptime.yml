@@ -1,0 +1,67 @@
+name: AuraBot uptime
+
+# Off-box probe: runs on GitHub's runners, not on the Mac it is watching.
+# Free on a public repo. Hourly is the floor GitHub allows for schedules.
+on:
+  schedule:
+    - cron: "7 * * * *"
+  workflow_dispatch:
+    inputs:
+      base:
+        description: "Base URL to probe (use a bad one to prove the alarm fires)"
+        required: false
+        default: "https://askaurabot.com"
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Probe the public site and the answer path
+        id: probe
+        env:
+          BASE: ${{ inputs.base || 'https://askaurabot.com' }}
+        run: |
+          chmod +x probe.sh
+          ./probe.sh || echo "down=1" >> "$GITHUB_OUTPUT"
+
+      - name: Open (or refresh) the incident issue
+        if: steps.probe.outputs.down == '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TITLE="DOWN: askaurabot.com probe failed"
+          BODY=$(printf 'The off-box probe failed at %s.\n\nRun: %s\n' \
+            "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID")
+          NUM=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "$TITLE in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$NUM" ]; then
+            gh issue comment "$NUM" --repo "$GITHUB_REPOSITORY" --body "$BODY"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body "$BODY"
+          fi
+
+      - name: Close the incident issue on recovery
+        if: steps.probe.outputs.down != '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          NUM=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "DOWN: askaurabot.com probe failed in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$NUM" ]; then
+            gh issue close "$NUM" --repo "$GITHUB_REPOSITORY" --comment "Recovered at $(date -u '+%Y-%m-%dT%H:%M:%SZ') — probe passing again."
+          fi
+
+      # A failed step fails the run, so GitHub emails the owner.
+      - name: Fail the run when the site is down
+        if: steps.probe.outputs.down == '1'
+        run: |
+          echo "site is down — see the incident issue"
+          exit 1
